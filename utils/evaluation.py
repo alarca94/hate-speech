@@ -1,5 +1,5 @@
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, f1_score
 
 from transformers import get_linear_schedule_with_warmup
 from models.nn import HateSpeechClassifier
@@ -14,6 +14,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch import nn
 
 import numpy as np
+import nltk
 
 import gc
 
@@ -107,14 +108,16 @@ def train_epoch(
     return correct_predictions.double() / n_examples, np.mean(losses)
 
 
-def eval_nn(model, data_loader, device):
+def eval_nn(model, data_loader, device, n_examples):
     model = model.eval()
     all_preds = []
+    correct_predictions = 0
 
     with torch.no_grad():
         for d in data_loader:
             input_ids = d['input_ids'].to(device, dtype=torch.long)
             attention_mask = d['attention_mask'].to(device, dtype=torch.long)
+            targets = d['targets'].to(device, dtype = torch.long)
 
             outputs = model(
                 input_ids=input_ids,
@@ -123,39 +126,46 @@ def eval_nn(model, data_loader, device):
             _, preds = torch.max(outputs, dim=1)
 
             all_preds.extend(preds.tolist())
+            correct_predictions += torch.sum(preds == targets)
 
             del input_ids, attention_mask, outputs, preds
             torch.cuda.empty_cache()
             gc.collect()
 
-    return all_preds
+    return all_preds, correct_predictions.double() / n_examples
 
 
-def evaluate_model(original_data, model_config, eval_config, seed=None, n_folds=5):
+def evaluate_model(original_data, model_config, eval_config, seed=None):
     if seed is not None:
         np.random.seed(seed)
         torch.manual_seed(seed)
 
-    skf = StratifiedKFold(n_splits=n_folds)
+    skf = StratifiedKFold(n_splits=eval_config['n_folds'])
     accuracies = []
     fold = 1
 
     data = original_data.copy()
-    basic_cols = ['text', 'toxicity_degree']
+    basic_cols = ['text']
     manual_cols = ['constructive', 'toxic', 'sarcasm_irony', 'mockery_ridicule', 'insults', 'argument_discussion',
                    'negative_toxic_lang', 'aggressiveness', 'intolerance']
+    manual_transformation = {'sí': 1, 'si': 1, 'no': 0, 'd': 0.5}
+    label_col = 'toxicity_degree'
     implemented_models = ['Random Forest', 'SVC', 'Logistic Regression']
 
     if eval_config['basic_manual_both'] == 2:
-        data = data[basic_cols + manual_cols]
+        for col in manual_cols:
+            data[col] = data[col].str.lower().map(manual_transformation)
+        data = data[basic_cols + manual_cols + [label_col]]
     elif eval_config['basic_manual_both'] == 1:
-        data = data[manual_cols]
+        for col in manual_cols:
+            data[col] = data[col].str.lower().map(manual_transformation)
+        data = data[manual_cols + [label_col]]
     else:
-        data = data[basic_cols]
+        data = data[basic_cols + [label_col]]
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-    for train_index, test_index in skf.split(data):
+    for train_index, test_index in skf.split(data, data[label_col].values):
         train = data.loc[train_index, :]
         test = data.loc[test_index, :]
         if model_config['name'].startswith('bert'):
@@ -166,7 +176,7 @@ def evaluate_model(original_data, model_config, eval_config, seed=None, n_folds=
                                                   model_config['batch_size'])
 
             # Create the model and load it into the device
-            model = HateSpeechClassifier(model_config['name'])
+            model = HateSpeechClassifier(model_config['name'], data[label_col].nunique())
             model = model.to(device)
 
             # Add the Adam optimizer
@@ -176,7 +186,8 @@ def evaluate_model(original_data, model_config, eval_config, seed=None, n_folds=
             scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
 
             # Use the cross entropy loss
-            loss_fn = nn.CrossEntropyLoss().to(device)
+            weights = torch.Tensor(1/train.groupby('toxicity_degree').size().sort_index().values)
+            loss_fn = nn.CrossEntropyLoss(weight=weights).to(device)
 
             # Evaluate model on test
             history = defaultdict(list)
@@ -193,26 +204,32 @@ def evaluate_model(original_data, model_config, eval_config, seed=None, n_folds=
 
                 history['train_acc'].append(train_acc)
                 history['train_loss'].append(train_loss)
+                
+                y_pred, test_acc = eval_nn(model, test_data_loader, device, len(test))
 
-            y_pred = eval_nn(model, test_data_loader, device)
+                print(f'Test  accuracy {test_acc}')
+                print()
+
+            # y_pred = eval_nn(model, test_data_loader, device, len(val))
 
         elif model_config['name'] in implemented_models:
-            train_x = train[[c for c in train.columns if c != 'toxicity_degree']]
-            train_y = train.toxicity_degree.values
+            train_x = train[[c for c in train.columns if c != label_col]]
+            train_y = train[label_col].values
 
-            test_x = test[[c for c in test.columns if c != 'toxicity_degree']]
+            test_x = test[[c for c in test.columns if c != label_col]]
 
             if eval_config['basic_manual_both'] != 1:
-                bow = TfidfVectorizer()
+                bow = TfidfVectorizer(strip_accents=model_config['strip_accents'], stop_words=model_config['stop_words'])
                 train_bow_feats = bow.fit_transform(train_x.text.values).todense()
 
                 # Perform dimensionality reduction
                 pca = PCA(n_components=model_config['PCA_components'], svd_solver=model_config['svd_solver'])
                 train_bow_feats = pca.fit_transform(train_bow_feats)
                 test_bow_feats = bow.transform(test_x.text.values).todense()
+                test_bow_feats = pca.transform(test_bow_feats)
 
-                train_x.drop('text')
-                test_x.drop('text')
+                train_x.drop('text', axis=1, inplace=True)
+                test_x.drop('text', axis=1, inplace=True)
 
                 train_x = np.hstack((train_x.values, train_bow_feats))
                 test_x = np.hstack((test_x.values, test_bow_feats))
@@ -242,11 +259,14 @@ def evaluate_model(original_data, model_config, eval_config, seed=None, n_folds=
             print('No valid model has been selected')
             return
 
-        accuracies.append(accuracy_score(test.toxicity_degree.values, y_pred))
-        print('Accuracy for Fold', fold, 'is:', np.round(accuracies[-1], 4))
+        accuracies.append(f1_score(test[label_col].values, y_pred, labels=data[label_col].unique(), average='macro'))
+        # print('Accuracy for Fold', fold, 'is:', np.round(accuracies[-1], 4))
 
         fold += 1
 
-    print('Total Prediction Accuracy is:', np.round(np.mean(accuracies), 4), '\u00B1', np.round(np.std(accuracies), 4))
+    mean_accuracy = np.mean(accuracies)
+    std_accuracy = np.std(accuracies)
+    
+    # print('Total Prediction Accuracy is:', np.round(mean_accuracy, 4), '\u00B1', np.round(std_accuracy, 4))
 
-    return
+    return mean_accuracy, std_accuracy

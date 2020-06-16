@@ -6,9 +6,9 @@ import torch.nn.functional as F
 
 class HateSpeechClassifier(nn.Module):
 
-    def __init__(self, PRE_TRAINED_MODEL_NAME, n_classes):
+    def __init__(self, model_name, n_classes):
         super(HateSpeechClassifier, self).__init__()
-        self.model = AutoModel.from_pretrained(PRE_TRAINED_MODEL_NAME)
+        self.model = AutoModel.from_pretrained(model_name)
         self.drop = nn.Dropout(p=0.3)
         self.out = nn.Linear(self.model.config.hidden_size, n_classes)
 
